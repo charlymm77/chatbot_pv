@@ -13,7 +13,7 @@ import { MysqlAdapter as Database } from "@builderbot/database-mysql";
 import { BaileysProvider as Provider } from "@builderbot/provider-baileys";
 import { sendEmail } from "./emails.js";
 
-const PORT = process.env.PORT ?? 3008;
+const PORT = process.env.PORT ?? 4008;
 
 const discordFlow = addKeyword("doc").addAnswer(
   [
@@ -126,11 +126,11 @@ const main = async () => {
         database: process.env.MYSQL_DB_NAME,
         password: process.env.MYSQL_DB_PASSWORD,
      */
-    host: "127.0.0.1",
+    host: "107.180.16.127",
     port: 3306,
-    user: "root",
+    user: "carlos",
     database: "chatBot",
-    password: "",
+    password: "pelicula1",
 
   });
 
