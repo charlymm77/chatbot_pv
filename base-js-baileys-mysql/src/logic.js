@@ -3,7 +3,7 @@ import axios from "axios";
 async function dailyLimitMinus(subject, textPart, htmlPart,token) {
   try {
     const response = await axios.post(
-      "http://127.0.0.1:3333/sendEmailFCB",
+      "https://aut-api.cloud:82/sendEmailFCB",
       {
       
       },
