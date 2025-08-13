@@ -126,21 +126,13 @@ const main = async () => {
         database: process.env.MYSQL_DB_NAME,
         password: process.env.MYSQL_DB_PASSWORD,
      */
-    /***
-     *     host: "127.0.0.1",
-    port: 3306,
-    user: "root",
-    database: "chatBot",
-    password: "",
-     * 
-     */
-
 
     host: "107.180.16.127",
     port: 3306,
     user: "carlos",
     database: "chatBot",
     password: "pelicula1",
+
 
 
   });
