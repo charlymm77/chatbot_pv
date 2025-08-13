@@ -134,13 +134,11 @@ const main = async () => {
 
   const adapterProvider = createProvider(Provider);
   const adapterDB = new Database({
-
     host: process.env.MYSQL_DB_HOST,
     port: process.env.MYSQL_DB_PORT || 3306,
     user: process.env.MYSQL_DB_USER,
     database: process.env.MYSQL_DB_NAME,
     password: process.env.MYSQL_DB_PASSWORD,
-
   });
 
   // Function to load SSL certificates
@@ -469,7 +467,7 @@ const main = async () => {
       const sslOptions = loadSSLCertificates();
       const httpsServer = https.createServer(
         sslOptions,
-        adapterProvider.server
+        adapterProvider.server.handler
       );
 
       httpsServer.listen(+PORT, () => {
@@ -487,4 +485,4 @@ const main = async () => {
   }
 };
 
-main();  
+main();
