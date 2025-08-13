@@ -49,6 +49,7 @@ const welcomeFlow = addKeyword(["hi", "hello", "hola"])
   );
 const responseFlowByChat = addKeyword([
   "ok",
+  "ook",
   "OK",
   "oc",
   "OC",
