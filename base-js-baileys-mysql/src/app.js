@@ -1,6 +1,11 @@
 import { join } from "path";
-import { writeFileSync, unlinkSync, existsSync } from "fs";
+import { writeFileSync, unlinkSync, existsSync, readFileSync } from "fs";
+import https from "https";
 import axios from "axios";
+import dotenv from "dotenv";
+
+// Load environment variables
+dotenv.config();
 import {
   createBot,
   createProvider,
@@ -14,6 +19,14 @@ import { BaileysProvider as Provider } from "@builderbot/provider-baileys";
 import { sendEmail } from "./emails.js";
 
 const PORT = process.env.PORT ?? 4008;
+
+// SSL Configuration
+const SSL_CONFIG = {
+  enabled: process.env.SSL_ENABLED === "true" || false,
+  keyPath: process.env.SSL_KEY_PATH || "./certs/private-key.pem",
+  certPath: process.env.SSL_CERT_PATH || "./certs/certificate.pem",
+  caPath: process.env.SSL_CA_PATH || null, // Optional CA bundle path
+};
 
 const discordFlow = addKeyword("doc").addAnswer(
   [
@@ -120,30 +133,36 @@ const main = async () => {
 
   const adapterProvider = createProvider(Provider);
   const adapterDB = new Database({
-    /**
-     *     host: process.env.MYSQL_DB_HOST,
-        user: process.env.MYSQL_DB_USER,
-        database: process.env.MYSQL_DB_NAME,
-        password: process.env.MYSQL_DB_PASSWORD,
-     */
-    /***
-     *     host: "127.0.0.1",
-    port: 3306,
-    user: "root",
-    database: "chatBot",
-    password: "",
-     * 
-     */
-
-
-    host: "107.180.16.127",
-    port: 3306,
-    user: "carlos",
-    database: "chatBot",
-    password: "pelicula1",
-
-
+    host: process.env.MYSQL_DB_HOST,
+    port: process.env.MYSQL_DB_PORT || 3306,
+    user: process.env.MYSQL_DB_USER,
+    database: process.env.MYSQL_DB_NAME,
+    password: process.env.MYSQL_DB_PASSWORD,
   });
+
+  // Function to load SSL certificates
+  const loadSSLCertificates = () => {
+    try {
+      const sslOptions = {
+        key: readFileSync(SSL_CONFIG.keyPath),
+        cert: readFileSync(SSL_CONFIG.certPath),
+      };
+
+      // Add CA bundle if specified
+      if (SSL_CONFIG.caPath && existsSync(SSL_CONFIG.caPath)) {
+        sslOptions.ca = readFileSync(SSL_CONFIG.caPath);
+      }
+
+      return sslOptions;
+    } catch (error) {
+      console.error("Error loading SSL certificates:", error.message);
+      console.error("Make sure the certificate files exist at:");
+      console.error("- Key:", SSL_CONFIG.keyPath);
+      console.error("- Cert:", SSL_CONFIG.certPath);
+      if (SSL_CONFIG.caPath) console.error("- CA:", SSL_CONFIG.caPath);
+      throw error;
+    }
+  };
 
   const { handleCtx, httpServer } = await createBot({
     flow: adapterFlow,
@@ -155,9 +174,8 @@ const main = async () => {
     "/v1/messages",
     handleCtx(async (bot, req, res) => {
       try {
-     
         const { number, message, pdf, xml, customerName } = req.body;
-        
+
         // Si el mensaje es null o vacío, usar un mensaje predeterminado
         const finalMessage =
           message && message.trim() !== ""
@@ -296,10 +314,10 @@ const main = async () => {
               Stack: ${xmlError.stack}
               Request Body: ${JSON.stringify(req.body, null, 2)}
             `;
-            await sendEmail(
-              "Error crítico en CHATBOT - Endpoint /v1/messages",
-              errorDetails,
-              `
+              await sendEmail(
+                "Error crítico en CHATBOT - Endpoint /v1/messages",
+                errorDetails,
+                `
               <h2>Error en el Sistema de CHATBOT</h2>
               <p><strong>Endpoint:</strong> /v1/messages</p>
               <p><strong>Timestamp:</strong> ${new Date().toISOString()}</p>
@@ -309,7 +327,7 @@ const main = async () => {
               <p><strong>Stack Trace:</strong></p>
               <pre>${xmlError.stack}</pre>
             `
-            );
+              );
               console.error("Error procesando XML:", xmlError);
               // Limpiar archivo si existe en caso de error
               if (existsSync(xmlFilePath)) {
@@ -357,10 +375,10 @@ const main = async () => {
           Stack: ${error.stack}
           Request Body: ${JSON.stringify(req.body, null, 2)}
         `;
-        await sendEmail(
-          "Error crítico en CHATBOT - Endpoint /v1/messages",
-          errorDetails,
-          `
+          await sendEmail(
+            "Error crítico en CHATBOT - Endpoint /v1/messages",
+            errorDetails,
+            `
           <h2>Error en el Sistema de CHATBOT</h2>
           <p><strong>Endpoint:</strong> /v1/messages</p>
           <p><strong>Timestamp:</strong> ${new Date().toISOString()}</p>
@@ -370,7 +388,7 @@ const main = async () => {
           <p><strong>Stack Trace:</strong></p>
           <pre>${error.stack}</pre>
         `
-        );
+          );
           res.writeHead(500, { "Content-Type": "application/json" });
           return res.end(
             JSON.stringify({
@@ -442,7 +460,28 @@ const main = async () => {
     })
   );
 
-  httpServer(+PORT);
+  // Start server with HTTPS if SSL is enabled
+  if (SSL_CONFIG.enabled) {
+    try {
+      const sslOptions = loadSSLCertificates();
+      const httpsServer = https.createServer(
+        sslOptions,
+        adapterProvider.server
+      );
+
+      httpsServer.listen(+PORT, () => {
+        console.log(`🔒 HTTPS Server running on port ${PORT}`);
+        console.log(`🔗 Server URL: https://localhost:${PORT}`);
+      });
+    } catch (error) {
+      console.error("Failed to start HTTPS server:", error.message);
+      console.log("Falling back to HTTP server...");
+      httpServer(+PORT);
+    }
+  } else {
+    console.log(`🌐 HTTP Server running on port ${PORT}`);
+    httpServer(+PORT);
+  }
 };
 
 main();
