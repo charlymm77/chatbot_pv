@@ -18,6 +18,13 @@ import {
 import { MysqlAdapter as Database } from "@builderbot/database-mysql";
 import { BaileysProvider as Provider } from "@builderbot/provider-baileys";
 import { sendEmail } from "./emails.js";
+import {
+  compressPDFToTarget,
+  exceedsSize,
+  getBufferSizeMB,
+  isValidPDF,
+  analyzePDF,
+} from "./pdf-utils.js";
 
 const PORT = process.env.PORT ?? 4009;
 
@@ -138,12 +145,33 @@ const main = async () => {
   ]);
 
   const adapterProvider = createProvider(Provider);
+  // Enhanced database configuration with connection pooling and retry logic
   const adapterDB = new Database({
     host: process.env.MYSQL_DB_HOST,
     port: process.env.MYSQL_DB_PORT || 3306,
     user: process.env.MYSQL_DB_USER,
     database: process.env.MYSQL_DB_NAME,
     password: process.env.MYSQL_DB_PASSWORD,
+    connectionLimit: parseInt(process.env.MYSQL_CONNECTION_LIMIT) || 10,
+    acquireTimeout: parseInt(process.env.MYSQL_ACQUIRE_TIMEOUT) || 60000,
+    idleTimeout: parseInt(process.env.MYSQL_IDLE_TIMEOUT) || 1800000,
+    reconnect: process.env.MYSQL_RECONNECT === "true" || true,
+    multipleStatements: false,
+    charset: "utf8mb4",
+    timezone: "local",
+    ssl: false,
+    // Additional connection options for stability
+    supportBigNumbers: true,
+    bigNumberStrings: true,
+    dateStrings: false,
+    debug: false,
+    trace: false,
+    stringifyObjects: false,
+    typeCast: true,
+    queryTimeout: 30000, // 30 seconds
+    // Reconnection options
+    reconnectTries: 3,
+    reconnectInterval: 1000,
   });
 
   // Function to load SSL certificates
@@ -189,46 +217,259 @@ const main = async () => {
     database: adapterDB,
   });
 
+  // Configure server limits BEFORE setting up routes
+  console.log("🔧 Configuring server limits...");
+  const maxPayloadMB = parseInt(process.env.MAX_PAYLOAD_SIZE_MB) || 100;
+  const maxPayloadBytes = maxPayloadMB * 1024 * 1024;
+
+  if (adapterProvider.server) {
+    // Set maximum request size
+    adapterProvider.server.maxRequestSize = maxPayloadBytes;
+    console.log(
+      `✅ Server maxRequestSize set to: ${maxPayloadBytes} bytes (${maxPayloadMB}MB)`
+    );
+
+    // If the server has a bodyParser, configure it too
+    if (adapterProvider.server.bodyParser) {
+      adapterProvider.server.bodyParser.limit = `${maxPayloadMB}mb`;
+      console.log(`✅ BodyParser limit set to ${maxPayloadMB}mb`);
+    }
+
+    // Try to configure additional server properties that might limit payload
+    if (adapterProvider.server.maxBodySize !== undefined) {
+      adapterProvider.server.maxBodySize = maxPayloadBytes;
+      console.log(`✅ Server maxBodySize set to: ${maxPayloadBytes} bytes`);
+    }
+
+    // Additional server configurations for handling large payloads
+    if (adapterProvider.server.server) {
+      adapterProvider.server.server.maxHeadersCount = 0;
+      adapterProvider.server.server.timeout = 300000; // 5 minutes
+      adapterProvider.server.server.keepAliveTimeout = 300000;
+      adapterProvider.server.server.headersTimeout = 300000;
+
+      // Additional HTTP parser limits
+      if (adapterProvider.server.server.maxRequestSize === undefined) {
+        adapterProvider.server.server.maxRequestSize = maxPayloadBytes;
+      }
+
+      console.log(
+        `✅ Server timeout and HTTP parser configurations set for large payloads`
+      );
+    }
+  }
+
+  // Add middleware to handle large payloads before the main handler
+  // Using already declared maxPayloadMB and maxPayloadBytes variables
+
+  // Add global error handler for the server
+  const originalHandler = adapterProvider.server.handler;
+  adapterProvider.server.handler = (req, res) => {
+    try {
+      // Only apply payload checking to methods that can have a body
+      const methodsWithBody = ["POST", "PUT", "PATCH"];
+      if (!methodsWithBody.includes(req.method)) {
+        // Skipping payload check for methods without body
+        return originalHandler(req, res);
+      }
+
+      // Use a more generous payload limit for the middleware (250MB)
+      // The actual business logic will handle PDF compression
+      const middlewareMaxBodySize = 250 * 1024 * 1024; // 250MB for middleware
+      console.log(
+        `🔧 Middleware payload limit: 250MB (${middlewareMaxBodySize} bytes)`
+      );
+      console.log(
+        `🔧 Business logic PDF limit: ${maxPayloadMB}MB (will compress if needed)`
+      );
+
+      let bodySize = 0;
+      let payloadTooLarge = false;
+
+      const originalOn = req.on;
+      req.on = function (event, listener) {
+        if (event === "data") {
+          const originalListener = listener;
+          const wrappedListener = (chunk) => {
+            bodySize += chunk.length;
+            if (bodySize > middlewareMaxBodySize && !payloadTooLarge) {
+              payloadTooLarge = true;
+              console.error(
+                `❌ Payload too large: ${Math.round(
+                  bodySize / 1024 / 1024
+                )}MB (middleware max: 250MB)`
+              );
+
+              if (!res.headersSent) {
+                res.writeHead(413, {
+                  "Content-Type": "application/json",
+                  Connection: "close",
+                });
+                res.end(
+                  JSON.stringify({
+                    status: "error",
+                    message: `Request payload too large. Maximum size is 250MB.`,
+                    maxSize: "250MB",
+                    receivedSize: `${Math.round(bodySize / 1024 / 1024)}MB`,
+                  })
+                );
+              }
+              return;
+            }
+            if (!payloadTooLarge) {
+              return originalListener(chunk);
+            }
+          };
+          return originalOn.call(this, event, wrappedListener);
+        }
+        return originalOn.call(this, event, listener);
+      };
+
+      // Add error handling for the response
+      const originalEnd = res.end;
+      res.end = function (chunk, encoding) {
+        try {
+          // If chunk is an Error object, convert it to JSON string
+          if (
+            chunk &&
+            typeof chunk === "object" &&
+            chunk.constructor &&
+            chunk.constructor.name &&
+            chunk.constructor.name.includes("Error")
+          ) {
+            const errorResponse = {
+              status: "error",
+              message: chunk.message || "Internal server error",
+              error: chunk.name || "Error",
+            };
+
+            if (
+              chunk.name === "PayloadTooLargeError" ||
+              chunk.constructor.name === "PayloadTooLargeError"
+            ) {
+              if (!res.headersSent) {
+                res.writeHead(413, { "Content-Type": "application/json" });
+              }
+              errorResponse.message = `Request payload too large. Please reduce the size of your request. Maximum size is ${maxPayloadMB}MB.`;
+              errorResponse.maxSize = `${maxPayloadMB}MB`;
+            } else {
+              if (!res.headersSent) {
+                res.writeHead(500, { "Content-Type": "application/json" });
+              }
+            }
+
+            return originalEnd.call(
+              this,
+              JSON.stringify(errorResponse),
+              encoding
+            );
+          }
+
+          // If it's already a string, buffer, or Uint8Array, pass it through
+          return originalEnd.call(this, chunk, encoding);
+        } catch (error) {
+          console.error("Error in response.end override:", error);
+          try {
+            if (!res.headersSent) {
+              res.writeHead(500, { "Content-Type": "application/json" });
+            }
+            return originalEnd.call(
+              this,
+              JSON.stringify({
+                status: "error",
+                message: "Internal server error",
+              }),
+              encoding
+            );
+          } catch (endError) {
+            console.error("Critical error in response.end:", endError);
+            return originalEnd.call(this, "Internal server error", encoding);
+          }
+        }
+      };
+
+      return originalHandler(req, res);
+    } catch (error) {
+      console.error("Global error handler caught:", error);
+      try {
+        if (!res.headersSent) {
+          if (
+            error.name === "PayloadTooLargeError" ||
+            error.message.includes("too large")
+          ) {
+            res.writeHead(413, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                status: "error",
+                message: `Request payload too large. Please reduce the size of your request. Maximum size is 250MB.`,
+                maxSize: "250MB",
+              })
+            );
+          } else {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                status: "error",
+                message: "Internal server error",
+                error: error.message,
+              })
+            );
+          }
+        }
+      } catch (responseError) {
+        console.error("Error sending error response:", responseError);
+        try {
+          if (!res.headersSent) {
+            res.writeHead(500);
+            res.end("Internal server error");
+          }
+        } catch (finalError) {
+          console.error("Critical error in final error handler:", finalError);
+        }
+      }
+    }
+  };
+
   // Event listeners para capturar QR y estado de conexión
-  adapterProvider.on('qr', (qr) => {
-    console.log('📱 QR Code generated');
+  adapterProvider.on("qr", (qr) => {
+    console.log("📱 QR Code generated");
     currentQR = qr;
     botConnected = false;
   });
 
-  adapterProvider.on('ready', () => {
-    console.log('✅ Bot connected to WhatsApp');
+  adapterProvider.on("ready", () => {
+    console.log("✅ Bot connected to WhatsApp");
     currentQR = null;
     botConnected = true;
   });
 
-  adapterProvider.on('auth_failure', () => {
-    console.log('❌ Authentication failed');
+  adapterProvider.on("auth_failure", () => {
+    console.log("❌ Authentication failed");
     currentQR = null;
     botConnected = false;
   });
 
-  adapterProvider.on('disconnected', () => {
-    console.log('⚠️ Bot disconnected from WhatsApp');
+  adapterProvider.on("disconnected", () => {
+    console.log("⚠️ Bot disconnected from WhatsApp");
     botConnected = false;
   });
 
   // También escuchar eventos del proveedor interno
   if (adapterProvider.vendor && adapterProvider.vendor.ev) {
-    adapterProvider.vendor.ev.on('connection.update', (update) => {
+    adapterProvider.vendor.ev.on("connection.update", (update) => {
       const { connection, lastDisconnect, qr } = update;
-      
+
       if (qr) {
-        console.log('📱 QR Code generated from vendor');
+        console.log("📱 QR Code generated from vendor");
         currentQR = qr;
         botConnected = false;
       }
-      
-      if (connection === 'close') {
-        console.log('⚠️ Connection closed');
+
+      if (connection === "close") {
+        console.log("⚠️ Connection closed");
         botConnected = false;
-      } else if (connection === 'open') {
-        console.log('✅ Connection opened');
+      } else if (connection === "open") {
+        console.log("✅ Connection opened");
         currentQR = null;
         botConnected = true;
       }
@@ -239,7 +480,41 @@ const main = async () => {
     "/v1/messages",
     handleCtx(async (bot, req, res) => {
       try {
+        console.log(`📨 Received request to /v1/messages`);
+
+        // Log request headers and content length for debugging
+        console.log(`📊 Request headers:`, req.headers);
+        console.log(
+          `📏 Content-Length: ${req.headers["content-length"]} bytes`
+        );
+
         const { number, message, pdf, xml, customerName } = req.body;
+
+        // Log payload sizes for debugging
+        if (pdf) {
+          const pdfSize = Buffer.byteLength(pdf, "base64");
+          const originalPdfSize = Math.round(pdfSize * 0.75); // Approximate original size
+          console.log(`📄 PDF base64 size: ${Math.round(pdfSize / 1024)}KB`);
+          console.log(
+            `📄 PDF original size (approx): ${Math.round(
+              originalPdfSize / 1024
+            )}KB`
+          );
+        }
+
+        if (xml) {
+          const xmlSize = Buffer.byteLength(xml, "utf8");
+          console.log(`📄 XML size: ${Math.round(xmlSize / 1024)}KB`);
+        }
+
+        // Log total request body size
+        const totalBodySize = Buffer.byteLength(
+          JSON.stringify(req.body),
+          "utf8"
+        );
+        console.log(
+          `📦 Total request body size: ${Math.round(totalBodySize / 1024)}KB`
+        );
 
         // Si el mensaje es null o vacío, usar un mensaje predeterminado
         const finalMessage =
@@ -256,7 +531,7 @@ const main = async () => {
         });
 
         try {
-          // Si hay un PDF, enviarlo
+          // Si hay un PDF, enviarlo con compresión automática
           if (pdf) {
             // Generar nombre único para el archivo temporal
             const timestamp = Date.now();
@@ -273,27 +548,141 @@ const main = async () => {
                 }
               };
 
+              let pdfBuffer;
+
               // Verificar si el contenido es base64 válido
               if (isValidBase64(pdf)) {
-                // Decodificar el base64 y guardar como archivo temporal
-                const pdfBuffer = Buffer.from(pdf, "base64");
-                writeFileSync(pdfFilePath, pdfBuffer);
-
-                // Enviar el archivo PDF
-                await bot.sendMessage(number, "", {
-                  media: pdfFilePath,
-                });
-
-                // Borrar el archivo temporal después del envío
-                if (existsSync(pdfFilePath)) {
-                  unlinkSync(pdfFilePath);
-                }
+                // Decodificar el base64
+                pdfBuffer = Buffer.from(pdf, "base64");
+                console.log(
+                  `📄 PDF original size: ${getBufferSizeMB(pdfBuffer).toFixed(
+                    2
+                  )} MB`
+                );
               } else {
                 // Si no es base64, asumir que es una ruta de archivo
-                await bot.sendMessage(number, "", { media: pdf });
+                if (existsSync(pdf)) {
+                  pdfBuffer = readFileSync(pdf);
+                  console.log(
+                    `📄 PDF loaded from file: ${getBufferSizeMB(
+                      pdfBuffer
+                    ).toFixed(2)} MB`
+                  );
+                } else {
+                  throw new Error(`PDF file not found: ${pdf}`);
+                }
+              }
+
+              // Validar que sea un PDF válido
+              if (!isValidPDF(pdfBuffer)) {
+                throw new Error("Invalid PDF format");
+              }
+
+              // Comprimir PDF si es necesario (mayor a 8MB)
+              const targetSizeMB = 25; // Límite de WhatsApp aproximado
+              const compressionThresholdMB = 8; // Comprimir si es mayor a 8MB
+
+              if (exceedsSize(pdfBuffer, compressionThresholdMB)) {
+                console.log(
+                  `🔄 PDF size (${getBufferSizeMB(pdfBuffer).toFixed(
+                    2
+                  )} MB) exceeds ${compressionThresholdMB}MB, compressing...`
+                );
+
+                // Analizar PDF para determinar estrategia de compresión
+                const analysis = await analyzePDF(pdfBuffer);
+                console.log(
+                  `📊 PDF Analysis: ${analysis.pages} pages, strategy: ${analysis.compressionStrategy}`
+                );
+
+                const startTime = performance.now();
+                const compressedBuffer = await compressPDFToTarget(
+                  pdfBuffer,
+                  targetSizeMB
+                );
+                const compressionTime = performance.now() - startTime;
+
+                const originalSizeMB = getBufferSizeMB(pdfBuffer);
+                const compressedSizeMB = getBufferSizeMB(compressedBuffer);
+                const compressionRatio = (
+                  ((originalSizeMB - compressedSizeMB) / originalSizeMB) *
+                  100
+                ).toFixed(1);
+
+                console.log(
+                  `✅ PDF compression completed in ${compressionTime.toFixed(
+                    0
+                  )}ms:`
+                );
+                console.log(`   - Original: ${originalSizeMB.toFixed(2)} MB`);
+                console.log(
+                  `   - Compressed: ${compressedSizeMB.toFixed(2)} MB`
+                );
+                console.log(`   - Reduction: ${compressionRatio}%`);
+
+                // Verificar si la compresión fue exitosa
+                if (
+                  compressedSizeMB < originalSizeMB &&
+                  isValidPDF(compressedBuffer)
+                ) {
+                  pdfBuffer = compressedBuffer;
+                  console.log(
+                    `🎯 Using compressed PDF: ${compressedSizeMB.toFixed(2)} MB`
+                  );
+                } else {
+                  console.log(
+                    `⚠️ Compression failed or didn't improve size, using original`
+                  );
+                }
+
+                // Verificar si aún es demasiado grande
+                if (exceedsSize(pdfBuffer, 45)) {
+                  const errorMsg = `PDF file is too large (${getBufferSizeMB(
+                    pdfBuffer
+                  ).toFixed(
+                    2
+                  )} MB). Maximum size allowed is 45MB even after compression.`;
+                  console.error(`❌ ${errorMsg}`);
+
+                  // Enviar mensaje de error al usuario
+                  await bot.sendMessage(
+                    number,
+                    `❌ Error: El archivo PDF es demasiado grande (${getBufferSizeMB(
+                      pdfBuffer
+                    ).toFixed(
+                      2
+                    )} MB). El tamaño máximo permitido es 45MB incluso después de la compresión. Por favor, reduzca el tamaño del archivo e intente nuevamente.`
+                  );
+
+                  throw new Error(errorMsg);
+                }
+              } else {
+                console.log(
+                  `✅ PDF size (${getBufferSizeMB(pdfBuffer).toFixed(
+                    2
+                  )} MB) is within limits, no compression needed`
+                );
+              }
+
+              // Guardar el PDF (original o comprimido) como archivo temporal
+              writeFileSync(pdfFilePath, pdfBuffer);
+              console.log(
+                `💾 Final PDF size: ${getBufferSizeMB(pdfBuffer).toFixed(
+                  2
+                )} MB - Ready to send`
+              );
+
+              // Enviar el archivo PDF
+              await bot.sendMessage(number, "", {
+                media: pdfFilePath,
+              });
+
+              // Borrar el archivo temporal después del envío
+              if (existsSync(pdfFilePath)) {
+                unlinkSync(pdfFilePath);
               }
             } catch (pdfError) {
-              console.error("Error procesando PDF:", pdfError);
+              console.error("❌ Error procesando PDF:", pdfError);
               // Limpiar archivo si existe en caso de error
               if (existsSync(pdfFilePath)) {
                 unlinkSync(pdfFilePath);
@@ -525,12 +914,54 @@ const main = async () => {
     })
   );
 
+  // Test endpoint to check payload limits
+  adapterProvider.server.post(
+    "/v1/test-payload",
+    handleCtx(async (bot, req, res) => {
+      try {
+        const maxPayloadMB = parseInt(process.env.MAX_PAYLOAD_SIZE_MB) || 100;
+        const bodySize = Buffer.byteLength(JSON.stringify(req.body), "utf8");
+
+        console.log(
+          `🧪 Test payload received: ${Math.round(bodySize / 1024)}KB`
+        );
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            status: "ok",
+            message: "Payload received successfully",
+            receivedSize: `${Math.round(bodySize / 1024)}KB`,
+            maxAllowed: `${maxPayloadMB}MB`,
+            timestamp: new Date().toISOString(),
+          })
+        );
+      } catch (error) {
+        console.error("Error in test payload endpoint:", error);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            status: "error",
+            message: error.message,
+          })
+        );
+      }
+    })
+  );
+
   // Ruta principal para mostrar el QR code en el navegador
   adapterProvider.server.get("/", async (req, res) => {
     try {
       // Intentar obtener el QR de diferentes fuentes
-      const qrCode = currentQR || adapterProvider.qr || (adapterProvider.vendor && adapterProvider.vendor.qr);
-      const isConnected = botConnected || (adapterProvider.vendor && adapterProvider.vendor.ws && adapterProvider.vendor.ws.readyState === 1);
+      const qrCode =
+        currentQR ||
+        adapterProvider.qr ||
+        (adapterProvider.vendor && adapterProvider.vendor.qr);
+      const isConnected =
+        botConnected ||
+        (adapterProvider.vendor &&
+          adapterProvider.vendor.ws &&
+          adapterProvider.vendor.ws.readyState === 1);
 
       let html = `
         <!DOCTYPE html>
@@ -570,7 +1001,7 @@ const main = async () => {
               font-size: 1.5em;
             }
             .status {
-              padding: 15px;
+              padding: 15px;ç
               border-radius: 10px;
               margin: 20px 0;
               font-weight: bold;
@@ -655,9 +1086,9 @@ const main = async () => {
           width: 300,
           margin: 2,
           color: {
-            dark: '#000000',
-            light: '#FFFFFF'
-          }
+            dark: "#000000",
+            light: "#FFFFFF",
+          },
         });
 
         html += `
@@ -694,9 +1125,19 @@ const main = async () => {
               <strong>API Endpoints disponibles:</strong><br>
               • GET /v1/qr - Obtener QR en JSON<br>
               • GET /v1/status - Estado de conexión<br>
-              • POST /v1/messages - Enviar mensajes<br>
+              • POST /v1/messages - Enviar mensajes (con compresión automática de PDF)<br>
               • POST /v1/register - Registrar usuario<br>
-              • POST /v1/blacklist - Gestionar lista negra
+              • POST /v1/blacklist - Gestionar lista negra<br>
+              • POST /v1/test-payload - Probar límites de payload<br>
+              • POST /v1/test-compression - Probar compresión de PDF<br>
+              • GET /v1/db-health - Estado de la base de datos<br>
+              <br>
+              <strong>Configuración actual:</strong><br>
+              • Límite máximo de payload (middleware): 250MB<br>
+              • Límite de PDF (business logic): ${maxPayloadMB}MB<br>
+              • Compresión automática de PDF: ✅ Activada<br>
+              • Umbral de compresión: 8MB<br>
+              • Tamaño máximo de PDF final: 45MB
             </div>
           </div>
           
@@ -732,7 +1173,10 @@ const main = async () => {
   // Ruta para obtener el código QR
   adapterProvider.server.get("/v1/qr", (req, res) => {
     try {
-      const qrCode = currentQR || adapterProvider.qr || (adapterProvider.vendor && adapterProvider.vendor.qr);
+      const qrCode =
+        currentQR ||
+        adapterProvider.qr ||
+        (adapterProvider.vendor && adapterProvider.vendor.qr);
 
       if (!qrCode) {
         res.writeHead(404, { "Content-Type": "application/json" });
@@ -768,8 +1212,16 @@ const main = async () => {
   // Ruta para obtener el estado de conexión del bot
   adapterProvider.server.get("/v1/status", (req, res) => {
     try {
-      const isConnected = botConnected || (adapterProvider.vendor && adapterProvider.vendor.ws && adapterProvider.vendor.ws.readyState === 1);
-      const qrAvailable = !!(currentQR || adapterProvider.qr || (adapterProvider.vendor && adapterProvider.vendor.qr));
+      const isConnected =
+        botConnected ||
+        (adapterProvider.vendor &&
+          adapterProvider.vendor.ws &&
+          adapterProvider.vendor.ws.readyState === 1);
+      const qrAvailable = !!(
+        currentQR ||
+        adapterProvider.qr ||
+        (adapterProvider.vendor && adapterProvider.vendor.qr)
+      );
 
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(
@@ -794,6 +1246,189 @@ const main = async () => {
     }
   });
 
+  // Test endpoint for large payloads
+  adapterProvider.server.post(
+    "/v1/test-payload",
+    handleCtx(async (bot, req, res) => {
+      try {
+        const bodySize = JSON.stringify(req.body).length;
+        console.log(
+          `🧪 Test payload received: ${Math.round(bodySize / 1024)}KB`
+        );
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            status: "success",
+            message: "Payload received successfully",
+            size: `${Math.round(bodySize / 1024)}KB`,
+            timestamp: new Date().toISOString(),
+          })
+        );
+      } catch (error) {
+        console.error("❌ Test payload error:", error);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            status: "error",
+            message: error.message,
+          })
+        );
+      }
+    })
+  );
+
+  // Test endpoint for PDF compression
+  adapterProvider.server.post(
+    "/v1/test-compression",
+    handleCtx(async (bot, req, res) => {
+      try {
+        console.log(`🧪 PDF compression test started`);
+        const { pdf } = req.body;
+
+        if (!pdf) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          return res.end(
+            JSON.stringify({
+              status: "error",
+              message: "PDF content is required in base64 format",
+            })
+          );
+        }
+
+        // Validate base64
+        const isValidBase64 = (str) => {
+          try {
+            return Buffer.from(str, "base64").toString("base64") === str;
+          } catch (err) {
+            return false;
+          }
+        };
+
+        if (!isValidBase64(pdf)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          return res.end(
+            JSON.stringify({
+              status: "error",
+              message: "Invalid base64 PDF content",
+            })
+          );
+        }
+
+        const pdfBuffer = Buffer.from(pdf, "base64");
+
+        if (!isValidPDF(pdfBuffer)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          return res.end(
+            JSON.stringify({
+              status: "error",
+              message: "Invalid PDF format",
+            })
+          );
+        }
+
+        // Analyze PDF
+        const analysis = await analyzePDF(pdfBuffer);
+        console.log(`📊 PDF Analysis:`, analysis);
+
+        // Compress PDF
+        const startTime = performance.now();
+        const compressedBuffer = await compressPDFToTarget(pdfBuffer, 25);
+        const compressionTime = performance.now() - startTime;
+
+        const originalSizeMB = getBufferSizeMB(pdfBuffer);
+        const compressedSizeMB = getBufferSizeMB(compressedBuffer);
+        const compressionRatio = (
+          ((originalSizeMB - compressedSizeMB) / originalSizeMB) *
+          100
+        ).toFixed(1);
+        const isValid = isValidPDF(compressedBuffer);
+        const targetAchieved = compressedSizeMB <= 25;
+
+        console.log(`✅ Compression test completed:`);
+        console.log(`   - Original: ${originalSizeMB.toFixed(2)} MB`);
+        console.log(`   - Compressed: ${compressedSizeMB.toFixed(2)} MB`);
+        console.log(`   - Reduction: ${compressionRatio}%`);
+        console.log(`   - Valid: ${isValid}`);
+        console.log(`   - Target achieved: ${targetAchieved}`);
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            status: "success",
+            analysis: {
+              size: analysis.size,
+              pages: analysis.pages,
+              hasImages: analysis.hasImages,
+              hasAnnotations: analysis.hasAnnotations,
+              compressionStrategy: analysis.compressionStrategy,
+            },
+            compression: {
+              originalSize: `${originalSizeMB.toFixed(2)} MB`,
+              compressedSize: `${compressedSizeMB.toFixed(2)} MB`,
+              compressionRatio: `${compressionRatio}%`,
+              processingTime: `${compressionTime.toFixed(2)}ms`,
+              isValid: isValid,
+              targetAchieved: targetAchieved,
+            },
+            compressedPdf: compressedBuffer.toString("base64"),
+            timestamp: new Date().toISOString(),
+          })
+        );
+      } catch (error) {
+        console.error("❌ PDF compression test error:", error);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            status: "error",
+            message: error.message,
+            timestamp: new Date().toISOString(),
+          })
+        );
+      }
+    })
+  );
+
+  // Database health check endpoint
+  adapterProvider.server.get("/v1/db-health", async (req, res) => {
+    try {
+      console.log("🔍 Checking database health...");
+
+      // Test database connection by trying to get a simple query
+      await adapterDB.getPrevByNumber("health-check");
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(
+        JSON.stringify({
+          status: "success",
+          message: "Database connection is healthy",
+          timestamp: new Date().toISOString(),
+          database: {
+            host: process.env.MYSQL_DB_HOST,
+            port: process.env.MYSQL_DB_PORT,
+            database: process.env.MYSQL_DB_NAME,
+            user: process.env.MYSQL_DB_USER,
+          },
+        })
+      );
+    } catch (error) {
+      console.error("❌ Database health check failed:", error);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      return res.end(
+        JSON.stringify({
+          status: "error",
+          message: `Database connection failed: ${error.message}`,
+          timestamp: new Date().toISOString(),
+          error: {
+            name: error.name,
+            code: error.code,
+            sqlState: error.sqlState,
+          },
+        })
+      );
+    }
+  });
+
   // Start server with HTTPS if SSL is enabled
   console.log(`SSL Configuration:`);
   console.log(`- SSL_ENABLED: ${process.env.SSL_ENABLED}`);
@@ -810,15 +1445,20 @@ const main = async () => {
 
       // Primero inicializar BuilderBot con HTTP para que genere el QR
       httpServer(+PORT);
-      
-      // Luego crear el servidor HTTPS que proxy al HTTP
-      const httpsServer = https.createServer(sslOptions, adapterProvider.server.handler);
 
-      const httpsPort =  4008; // Puerto 5008 para HTTPS
+      // Luego crear el servidor HTTPS que proxy al HTTP
+      const httpsServer = https.createServer(
+        sslOptions,
+        adapterProvider.server.handler
+      );
+
+      const httpsPort = 4008; // Puerto 5008 para HTTPS
       httpsServer.listen(httpsPort, () => {
         console.log(`� HTTPS  Server running on port ${httpsPort}`);
         console.log(`� HTTPSd URL: https://localhost:${httpsPort}`);
-        console.log(`🌐 HTTP URL: http://localhost:${PORT} (for QR generation)`);
+        console.log(
+          `🌐 HTTP URL: http://localhost:${PORT} (for QR generation)`
+        );
         console.log(`📱 QR Code available at both URLs`);
       });
 
